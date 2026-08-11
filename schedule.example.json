@@ -1,0 +1,38 @@
+{
+  "settings": {
+    "warnMinutes": [10, 5, 1],
+    "sound": true,
+    "startSound": "Glass",
+    "warnSound": "Tink",
+    "opacity": 1.0,
+    "compact": false,
+    "showSeconds": true,
+    "windowLevel": "screenSaver",
+    "clickThrough": false,
+    "scale": 1.0,
+    "distractions": {
+      "enabled": true,
+      "apps": ["Instagram", "TikTok"],
+      "sites": ["instagram.com", "tiktok.com", "x.com", "reddit.com", "youtube.com"],
+      "graceSeconds": 20,
+      "escalateAfterMinutes": 5,
+      "onlyDuringBlocks": true,
+      "allowDuringTitles": ["Marketing", "Events"],
+      "chimeOnEscalate": true,
+      "message": "back to it?",
+      "debug": false
+    }
+  },
+  "blocks": [
+    { "title": "Workout",              "start": "05:00", "end": "07:00", "color": "#B4552D" },
+    { "title": "Family Time",          "start": "07:00", "end": "09:00", "color": "#4F7C6E" },
+    { "title": "Build Time",           "start": "09:00", "end": "14:00", "days": ["weekdays"], "note": "no Slack", "color": "#2E5C8A" },
+    { "title": "Family Time",          "start": "14:00", "end": "15:00", "color": "#4F7C6E" },
+    { "title": "Marketing + Content",  "start": "15:00", "end": "18:00", "days": ["weekdays"], "color": "#7B5EA7" },
+    { "title": "Reading",              "start": "18:00", "end": "19:00", "color": "#5A6570" },
+    { "title": "Family Time",          "start": "19:00", "end": "20:00", "color": "#4F7C6E" },
+    { "title": "Events — applying",    "start": "20:00", "end": "21:00", "color": "#A6772C" },
+    { "title": "Reading",              "start": "21:00", "end": "23:00", "color": "#5A6570" },
+    { "title": "Sleep",                "start": "23:00", "end": "05:00", "note": "crosses midnight", "color": "#5A6570" }
+  ]
+}

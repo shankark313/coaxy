@@ -1,0 +1,20 @@
+# build output
+*.o
+*.dSYM/
+build/
+TaskHUD.app/
+
+# local backups from iterating
+*.bak
+*.bak[0-9]
+*.tmp
+.p_*.swift
+.patch_*.swift
+
+# personal data — never commit these
+schedule.json
+adherence.json
+taskhud.log
+*.corrupt-*.json
+
+.DS_Store
