@@ -1,6 +1,6 @@
-# TaskHUD
+# Coaxy
 
-An always-on-top macOS heads-up display for a time-blocked day. It shows the block you're in, counts it down, lets you mark whether you actually did it, and turns red when you drift onto a site you told it to watch.
+A small character that sits above every window and keeps your day honest. It shows the block you're in, counts it down, lets you mark whether you actually did it, and turns red when you drift onto a site you told it to watch.
 
 One Swift file. No Xcode project, no dependencies, no package manager. ~600KB binary.
 
@@ -24,9 +24,11 @@ A small card in the corner, above every window, on every Space, including other 
 
 Requires macOS 12+ and Xcode Command Line Tools (`xcode-select --install`).
 
+> **Not notarized yet.** If you install from the DMG rather than building, right-click Coaxy and choose **Open** the first time — a normal double-click will be refused. Notarization needs an Apple organisation account, which is in progress.
+
 ```bash
-git clone <this repo> taskhud
-cd taskhud
+git clone <this repo> coaxy
+cd coaxy
 chmod +x install.sh
 ./install.sh --login
 ```
@@ -35,13 +37,15 @@ chmod +x install.sh
 
 The installer builds a real `.app` bundle rather than a bare binary — macOS only grants Automation permission (needed to read browser tabs) to bundled, signed applications — and ad-hoc signs it.
 
+**Package a DMG:** `./install.sh --dmg`
+
 **Uninstall:** `./install.sh --uninstall`. Your schedule and adherence log are kept.
 
 ---
 
 ## Your day
 
-Everything is `~/.taskhud/schedule.json`. Save it and the HUD hot-reloads within a second. A starter file is written on first run; `schedule.example.json` here is a fuller one.
+Everything is `~/.coaxy/schedule.json`. Save it and the HUD hot-reloads within a second. A starter file is written on first run; `schedule.example.json` here is a fuller one.
 
 Minimum viable:
 
@@ -106,7 +110,7 @@ Two decisions worth knowing:
 - **Adherence is done ÷ marked, not done ÷ scheduled.** Unmarked blocks are ignored entirely, never counted as missed. A metric that punishes you for forgetting to tick a box stops getting ticked.
 - **Days with no marks draw as a faint stub, not a zero bar.** A day you didn't record is not a day you failed.
 
-Stored at `~/.taskhud/adherence.json`, written atomically. If it ever fails to parse it's copied aside rather than overwritten.
+Stored at `~/.coaxy/adherence.json`, written atomically. If it ever fails to parse it's copied aside rather than overwritten.
 
 ---
 
@@ -132,7 +136,7 @@ After `graceSeconds` on a watched site the whole card washes soft red with a lin
 
 Also quiet during free time (`onlyDuringBlocks`), while paused, and when the screen is locked.
 
-**Permissions.** Reading the frontmost browser tab needs Automation permission; macOS prompts once per browser. Set `"debug": true` to log every poll to `~/.taskhud/taskhud.log` while tuning.
+**Permissions.** Reading the frontmost browser tab needs Automation permission; macOS prompts once per browser. Set `"debug": true` to log every poll to `~/.coaxy/coaxy.log` while tuning.
 
 Supported for tab URLs: Safari, Chrome, Brave, Arc, Edge, Vivaldi, Opera. **Firefox exposes no scriptable tab URL** and falls back to app-name matching.
 
@@ -175,14 +179,14 @@ This is not an unserved need, and you should probably buy one of these instead:
 - **[Chunk](https://www.chunkapp.net/)** — macOS-native time blocking with a countdown that floats over fullscreen apps
 - **[1Focus](https://onefocusapp.com/)** — per-site recurring schedules, ~$10/year
 
-TaskHUD exists because I wanted all of it in one always-visible card driven by a text file I control. That's a taste preference, not a market insight.
+Coaxy exists because I wanted all of it in one always-visible card driven by a text file I control. That's a taste preference, not a market insight.
 
 ---
 
 ## Troubleshooting
 
 ```bash
-tail -f ~/.taskhud/taskhud.log
+tail -f ~/.coaxy/coaxy.log
 ```
 
 Card missing but the menu bar item is there? It may be off-screen from a previous monitor — menu bar → **Reset position**.

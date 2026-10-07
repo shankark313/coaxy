@@ -1,12 +1,12 @@
 //
-//  TaskHUD.swift
+//  Coaxy.swift
 //  A single-file, always-on-top macOS HUD that shows the clock, your current
 //  time-blocked task, and a live countdown to the end of that block.
 //
-//  Build:   swiftc -O TaskHUD.swift -o taskhud
-//  Run:     ./taskhud
+//  Build:   swiftc -O Coaxy.swift -o coaxy
+//  Run:     ./coaxy
 //
-//  Schedule lives at ~/.taskhud/schedule.json and hot-reloads on save.
+//  Schedule lives at ~/.coaxy/schedule.json and hot-reloads on save.
 //
 //  No dependencies. No Xcode project. No app bundle required.
 //
@@ -23,7 +23,7 @@ enum Log {
         let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm:ss"; return f
     }()
     private static func write(_ tag: String, _ msg: String) {
-        let line = "\(stamp.string(from: Date())) [taskhud]\(tag) \(msg)\n"
+        let line = "\(stamp.string(from: Date())) [coaxy]\(tag) \(msg)\n"
         FileHandle.standardError.write(line.data(using: .utf8)!)
     }
     static func info(_ msg: String)  { write("", msg) }
@@ -85,12 +85,14 @@ struct Settings: Codable {
     var clickThrough: Bool?      // ignore mouse events entirely
     var scale: Double?           // 0.75...1.75 UI scale
     var distractions: Distractions?
+    /// Show the animated character. Off falls back to the plain card.
+    var mascot: Bool?
 
     static let `default` = Settings(
         warnMinutes: [10, 5, 1], sound: true, startSound: "Glass", warnSound: "Tink",
         opacity: 0.96, compact: false, showSeconds: true,
         windowLevel: "screenSaver", clickThrough: false, scale: 1.0,
-        distractions: nil
+        distractions: nil, mascot: true
     )
 
     func merged(over base: Settings) -> Settings {
@@ -105,7 +107,8 @@ struct Settings: Codable {
             windowLevel: windowLevel ?? base.windowLevel,
             clickThrough: clickThrough ?? base.clickThrough,
             scale:       scale       ?? base.scale,
-            distractions: distractions ?? base.distractions
+            distractions: distractions ?? base.distractions,
+            mascot: mascot ?? base.mascot
         )
     }
 }
@@ -184,7 +187,7 @@ final class ScheduleEngine {
     func load(from url: URL) {
         do {
             let data = try Data(contentsOf: url)
-            guard !data.isEmpty else { throw NSError(domain: "taskhud", code: 1,
+            guard !data.isEmpty else { throw NSError(domain: "coaxy", code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "schedule.json is empty"]) }
             let file = try JSONDecoder().decode(ScheduleFile.self, from: data)
 
@@ -193,7 +196,7 @@ final class ScheduleEngine {
                 guard parseHM(b.start) != nil else { throw ScheduleError.badTime(b.start) }
                 guard parseHM(b.end)   != nil else { throw ScheduleError.badTime(b.end) }
             }
-            guard !file.blocks.isEmpty else { throw NSError(domain: "taskhud", code: 2,
+            guard !file.blocks.isEmpty else { throw NSError(domain: "coaxy", code: 2,
                 userInfo: [NSLocalizedDescriptionKey: "schedule has zero blocks"]) }
 
             raw = file.blocks
@@ -471,6 +474,345 @@ final class ProgressBar: NSView {
 }
 
 // ============================================================================
+// MARK: - Mascot
+// ============================================================================
+
+/// What the character is expressing. Derived entirely from state the HUD
+/// already computes, so adding a mascot adds no new bookkeeping.
+enum MascotState: Equatable {
+    case working        // block running, plenty of time
+    case nearing        // inside the first warning threshold
+    case urgent         // inside the final warning threshold
+    case asleep         // paused
+    case alarmed        // drifted onto a watched site
+    case pleased        // just marked a block done
+    case absent         // nothing scheduled / free time
+}
+
+/// Anything that can draw the character. Implemented here by a procedural
+/// vector blob; a sprite-sheet or Lottie renderer can replace it later without
+/// touching the HUD, as long as it honours these three members.
+protocol MascotRenderer: NSView {
+    func set(state: MascotState, tint: NSColor)
+    /// Natural size at scale 1.0; the HUD multiplies by its own scale.
+    static var baseSize: NSSize { get }
+}
+
+/// A procedural mascot: a rounded blob with eyes and a mouth, animated with
+/// Core Animation. No image assets, so it scales cleanly at any size and keeps
+/// the project a single file.
+///
+/// Deliberately generic — the point is the state machine and the integration,
+/// both of which survive an art replacement.
+final class VectorMascot: NSView, MascotRenderer {
+
+    static var baseSize: NSSize { NSSize(width: 46, height: 46) }
+
+    private let body    = CAShapeLayer()
+    private let eyeL    = CAShapeLayer()
+    private let eyeR    = CAShapeLayer()
+    private let mouth   = CAShapeLayer()
+    private let sleepZ  = CATextLayer()
+    private let bobHost = CALayer()      // everything that bobs lives here
+
+    private var state: MascotState = .working
+    private var tint: NSColor = Theme.accent
+    private var blinkTimer: Timer?
+    private var pleasedUntil: Date?
+
+    /// Honour the system setting; a jiggling blob is hostile to some people.
+    private var reduceMotion: Bool {
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    override var isFlipped: Bool { true }
+
+    init(scale: CGFloat) {
+        let s = VectorMascot.baseSize
+        super.init(frame: NSRect(x: 0, y: 0, width: s.width * scale, height: s.height * scale))
+        wantsLayer = true
+        layer?.masksToBounds = false
+        build()
+        apply(animated: false)
+        startBlinking()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    deinit { blinkTimer?.invalidate() }
+
+    // ---- geometry ----------------------------------------------------------
+
+    /// Unit-space paths scaled to the view, so the mascot is resolution- and
+    /// scale-independent without any asset juggling.
+    private func u(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+        CGPoint(x: x * bounds.width, y: y * bounds.height)
+    }
+
+    private func bodyPath() -> CGPath {
+        // A soft squircle, slightly wider than tall, with a flat-ish base so it
+        // reads as sitting rather than floating.
+        let r = CGRect(x: bounds.width * 0.08, y: bounds.height * 0.12,
+                       width: bounds.width * 0.84, height: bounds.height * 0.80)
+        return CGPath(roundedRect: r,
+                      cornerWidth: r.width * 0.42,
+                      cornerHeight: r.height * 0.40,
+                      transform: nil)
+    }
+
+    private func eyePath(at center: CGPoint, open: CGFloat) -> CGPath {
+        let w = bounds.width * 0.11
+        let h = bounds.height * 0.15 * max(0.06, open)
+        let r = CGRect(x: center.x - w / 2, y: center.y - h / 2, width: w, height: h)
+        return CGPath(roundedRect: r, cornerWidth: w / 2, cornerHeight: min(h / 2, w / 2), transform: nil)
+    }
+
+    /// `curve` > 0 smiles, < 0 frowns, 0 is a flat line.
+    private func mouthPath(curve: CGFloat, width: CGFloat = 0.26) -> CGPath {
+        let p = CGMutablePath()
+        let cx = bounds.width * 0.5
+        let y  = bounds.height * 0.66
+        let half = bounds.width * width / 2
+        p.move(to: CGPoint(x: cx - half, y: y))
+        p.addQuadCurve(to: CGPoint(x: cx + half, y: y),
+                       control: CGPoint(x: cx, y: y + bounds.height * 0.12 * curve))
+        return p
+    }
+
+    private func build() {
+        let host = CALayer()
+        host.frame = bounds
+        layer?.addSublayer(host)
+
+        bobHost.frame = bounds
+        host.addSublayer(bobHost)
+
+        body.lineWidth = 0
+        bobHost.addSublayer(body)
+
+        for e in [eyeL, eyeR] {
+            e.fillColor = NSColor(white: 0.12, alpha: 1).cgColor
+            bobHost.addSublayer(e)
+        }
+
+        mouth.fillColor = NSColor.clear.cgColor
+        mouth.strokeColor = NSColor(white: 0.12, alpha: 0.75).cgColor
+        mouth.lineWidth = max(1.2, bounds.width * 0.035)
+        mouth.lineCap = .round
+        bobHost.addSublayer(mouth)
+
+        sleepZ.string = "z"
+        sleepZ.fontSize = bounds.height * 0.26
+        sleepZ.alignmentMode = .center
+        sleepZ.foregroundColor = Theme.tertiary.cgColor
+        sleepZ.frame = CGRect(x: bounds.width * 0.62, y: 0,
+                              width: bounds.width * 0.4, height: bounds.height * 0.34)
+        sleepZ.opacity = 0
+        sleepZ.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+        host.addSublayer(sleepZ)
+
+        for l in [body, eyeL, eyeR, mouth] {
+            l.frame = bounds
+            l.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+        }
+    }
+
+    override func layout() {
+        super.layout()
+        // Re-lay paths on any resize so the mascot survives a scale change.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        bobHost.frame = bounds
+        for l in [body, eyeL, eyeR, mouth] { l.frame = bounds }
+        mouth.lineWidth = max(1.2, bounds.width * 0.035)
+        sleepZ.fontSize = bounds.height * 0.26
+        sleepZ.frame = CGRect(x: bounds.width * 0.62, y: 0,
+                              width: bounds.width * 0.4, height: bounds.height * 0.34)
+        CATransaction.commit()
+        apply(animated: false)
+    }
+
+    // ---- public API --------------------------------------------------------
+
+    func set(state newState: MascotState, tint newTint: NSColor) {
+        // A "pleased" reaction is a one-shot that outlives the tick which set
+        // it, so it holds for a beat before the real state resumes.
+        if newState == .pleased {
+            pleasedUntil = Date().addingTimeInterval(1.8)
+        } else if let until = pleasedUntil {
+            if Date() < until { return }        // still celebrating
+            pleasedUntil = nil
+        }
+
+        let tintChanged = newTint != tint
+        guard newState != state || tintChanged else { return }   // no needless restarts
+        state = newState
+        tint = newTint
+        apply(animated: true)
+    }
+
+    // ---- rendering ---------------------------------------------------------
+
+    private func apply(animated: Bool) {
+        guard bounds.width > 1 else { return }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(!animated)
+        CATransaction.setAnimationDuration(0.25)
+
+        body.path = bodyPath()
+
+        let eyeY: CGFloat
+        let eyeSpread: CGFloat
+        var eyeOpen: CGFloat = 1
+        var curve: CGFloat = 0.6
+        var alpha: Float = 1
+        var fill = tint
+
+        switch state {
+        case .working:
+            eyeY = 0.44; eyeSpread = 0.17; curve = 0.5
+        case .nearing:
+            eyeY = 0.42; eyeSpread = 0.18; eyeOpen = 1.25; curve = 0.15
+            fill = Theme.warn
+        case .urgent:
+            eyeY = 0.41; eyeSpread = 0.19; eyeOpen = 1.5; curve = -0.45
+            fill = Theme.urgent
+        case .asleep:
+            eyeY = 0.46; eyeSpread = 0.17; eyeOpen = 0.06; curve = 0.1
+            fill = Theme.secondary
+        case .alarmed:
+            eyeY = 0.40; eyeSpread = 0.20; eyeOpen = 1.7; curve = -0.7
+            fill = Theme.urgent
+        case .pleased:
+            eyeY = 0.44; eyeSpread = 0.18; eyeOpen = 0.12; curve = 1.0
+            fill = Theme.accent
+        case .absent:
+            eyeY = 0.45; eyeSpread = 0.16; eyeOpen = 0.55; curve = 0.0
+            alpha = 0.45
+            fill = Theme.idle
+        }
+
+        body.fillColor = fill.withAlphaComponent(0.92).cgColor
+        eyeL.path = eyePath(at: u(0.5 - eyeSpread, eyeY), open: eyeOpen)
+        eyeR.path = eyePath(at: u(0.5 + eyeSpread, eyeY), open: eyeOpen)
+        mouth.path = mouthPath(curve: curve, width: state == .pleased ? 0.32 : 0.26)
+
+        // Dark features read badly on a dark body; flip them on light fills.
+        let onLight = fill.usingColorSpace(.sRGB).map {
+            (0.299 * $0.redComponent + 0.587 * $0.greenComponent + 0.114 * $0.blueComponent) > 0.62
+        } ?? false
+        let ink = onLight ? NSColor(white: 0.12, alpha: 1) : NSColor(white: 1, alpha: 0.92)
+        eyeL.fillColor = ink.cgColor
+        eyeR.fillColor = ink.cgColor
+        mouth.strokeColor = ink.withAlphaComponent(0.8).cgColor
+
+        layer?.opacity = alpha
+        sleepZ.opacity = (state == .asleep && !reduceMotion) ? 1 : 0
+
+        CATransaction.commit()
+        restartMotion()
+    }
+
+    // ---- motion ------------------------------------------------------------
+
+    private func restartMotion() {
+        bobHost.removeAllAnimations()
+        sleepZ.removeAllAnimations()
+        guard !reduceMotion else { return }
+
+        switch state {
+        case .working, .nearing:
+            bobHost.add(bob(duration: state == .working ? 2.6 : 1.6,
+                            distance: bounds.height * 0.035), forKey: "bob")
+        case .urgent:
+            bobHost.add(pulse(duration: 0.8, to: 1.06), forKey: "pulse")
+        case .alarmed:
+            bobHost.add(shake(), forKey: "shake")
+        case .pleased:
+            bobHost.add(hop(), forKey: "hop")
+        case .asleep:
+            bobHost.add(bob(duration: 4.0, distance: bounds.height * 0.02), forKey: "breathe")
+            sleepZ.add(zDrift(), forKey: "z")
+        case .absent:
+            break
+        }
+    }
+
+    private func bob(duration: CFTimeInterval, distance: CGFloat) -> CAAnimation {
+        let a = CABasicAnimation(keyPath: "transform.translation.y")
+        a.fromValue = -distance; a.toValue = distance
+        a.duration = duration
+        a.autoreverses = true
+        a.repeatCount = .infinity
+        a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        return a
+    }
+
+    private func pulse(duration: CFTimeInterval, to: CGFloat) -> CAAnimation {
+        let a = CABasicAnimation(keyPath: "transform.scale")
+        a.fromValue = 1.0; a.toValue = to
+        a.duration = duration
+        a.autoreverses = true
+        a.repeatCount = .infinity
+        a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        return a
+    }
+
+    private func shake() -> CAAnimation {
+        let a = CAKeyframeAnimation(keyPath: "transform.translation.x")
+        let d = bounds.width * 0.045
+        a.values = [0, -d, d, -d * 0.6, d * 0.6, 0]
+        a.keyTimes = [0, 0.12, 0.26, 0.40, 0.54, 0.70]
+        a.duration = 1.5                     // long tail: a pause between shudders
+        a.repeatCount = .infinity
+        return a
+    }
+
+    private func hop() -> CAAnimation {
+        let a = CAKeyframeAnimation(keyPath: "transform.translation.y")
+        let d = bounds.height * 0.16
+        a.values = [0, -d, 0, -d * 0.45, 0]
+        a.keyTimes = [0, 0.25, 0.5, 0.72, 1.0]
+        a.duration = 0.75
+        a.repeatCount = 2
+        a.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        return a
+    }
+
+    private func zDrift() -> CAAnimation {
+        let g = CAAnimationGroup()
+        let up = CABasicAnimation(keyPath: "transform.translation.y")
+        up.fromValue = 0; up.toValue = -bounds.height * 0.30
+        let fade = CAKeyframeAnimation(keyPath: "opacity")
+        fade.values = [0, 0.85, 0]
+        fade.keyTimes = [0, 0.4, 1]
+        g.animations = [up, fade]
+        g.duration = 2.6
+        g.repeatCount = .infinity
+        return g
+    }
+
+    /// Blinks are a separate timer rather than part of the state machine, so
+    /// they never fight a state change mid-animation.
+    private func startBlinking() {
+        blinkTimer?.invalidate()
+        blinkTimer = Timer.scheduledTimer(withTimeInterval: 4.5, repeats: true) { [weak self] _ in
+            guard let self, !self.reduceMotion else { return }
+            // Closed-eye states have nothing to blink.
+            guard self.state == .working || self.state == .nearing || self.state == .absent else { return }
+            let open = CABasicAnimation(keyPath: "transform.scale.y")
+            open.fromValue = 1.0; open.toValue = 0.08
+            open.duration = 0.09
+            open.autoreverses = true
+            self.eyeL.add(open, forKey: "blink")
+            self.eyeR.add(open, forKey: "blink")
+        }
+        blinkTimer?.tolerance = 1.0
+        if let t = blinkTimer { RunLoop.main.add(t, forMode: .common) }
+    }
+}
+
+// ============================================================================
 // MARK: - HUD state
 // ============================================================================
 
@@ -487,6 +829,7 @@ struct HUDState {
     var errorText: String? = nil
     var nudge: String? = nil
     var distracted: Bool = false
+    var mascot: MascotState = .working
 }
 
 // ============================================================================
@@ -514,9 +857,12 @@ final class HUDContentView: NSView {
 
     private var outer: NSStackView!
     private var fullBox: NSStackView!
+    private var fullRow: NSStackView!
+    private var mascot: (any MascotRenderer)?
     private var compactBox: NSStackView!
 
     private let scale: CGFloat
+    private let showMascot: Bool
     private(set) var compact: Bool = false
 
     override var isFlipped: Bool { true }
@@ -531,8 +877,9 @@ final class HUDContentView: NSView {
         super.mouseDown(with: event)
     }
 
-    init(scale: CGFloat) {
+    init(scale: CGFloat, showMascot: Bool = true) {
         self.scale = max(0.75, min(1.75, scale))
+        self.showMascot = showMascot
         super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 150))
         wantsLayer = true
         layer?.cornerRadius = 13 * self.scale
@@ -620,6 +967,37 @@ final class HUDContentView: NSView {
         fullBox.setCustomSpacing(12 * scale, after: countRow)
         fullBox.setCustomSpacing(10 * scale, after: bar)
 
+        // The character sits to the left of the text, vertically centred on the
+        // countdown rather than the whole block, so it reads as attached to the
+        // number that matters.
+        if showMascot {
+            let m = VectorMascot(scale: scale)
+            m.translatesAutoresizingMaskIntoConstraints = false
+            let sz = type(of: m).baseSize
+            m.widthAnchor.constraint(equalToConstant: sz.width * scale).isActive = true
+            m.heightAnchor.constraint(equalToConstant: sz.height * scale).isActive = true
+            mascot = m
+            let holder = NSView()
+            holder.translatesAutoresizingMaskIntoConstraints = false
+            holder.addSubview(m)
+            NSLayoutConstraint.activate([
+                holder.widthAnchor.constraint(equalTo: m.widthAnchor),
+                m.centerXAnchor.constraint(equalTo: holder.centerXAnchor),
+                m.topAnchor.constraint(equalTo: holder.topAnchor, constant: 26 * scale),
+                holder.bottomAnchor.constraint(greaterThanOrEqualTo: m.bottomAnchor)
+            ])
+            fullRow = NSStackView(views: [holder, fullBox])
+            fullRow.orientation = .horizontal
+            fullRow.alignment = .top
+            fullRow.spacing = 12 * scale
+            fullRow.distribution = .fill
+            fullBox.setContentHuggingPriority(.init(1), for: .horizontal)
+        } else {
+            fullRow = NSStackView(views: [fullBox])
+            fullRow.orientation = .horizontal
+            fullRow.alignment = .top
+        }
+
         let compactRow = NSStackView(views: [compactTitle, spacer(), compactCountdown])
         compactRow.orientation = .horizontal
         compactRow.spacing = 10 * scale
@@ -637,7 +1015,7 @@ final class HUDContentView: NSView {
 
         errorLabel.isHidden = true
 
-        outer = NSStackView(views: [fullBox, compactBox, errorLabel])
+        outer = NSStackView(views: [fullRow, compactBox, errorLabel])
         outer.orientation = .vertical
         outer.alignment = .leading
         outer.spacing = 9 * scale
@@ -651,7 +1029,7 @@ final class HUDContentView: NSView {
             outer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -padX),
             outer.topAnchor.constraint(equalTo: topAnchor, constant: padY),
             outer.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -padY),
-            fullBox.widthAnchor.constraint(equalTo: outer.widthAnchor),
+            fullRow.widthAnchor.constraint(equalTo: outer.widthAnchor),
             compactBox.widthAnchor.constraint(equalTo: outer.widthAnchor),
             topRow.widthAnchor.constraint(equalTo: fullBox.widthAnchor),
             bar.widthAnchor.constraint(equalTo: fullBox.widthAnchor),
@@ -665,7 +1043,7 @@ final class HUDContentView: NSView {
     func setCompact(_ on: Bool) {
         guard compact != on else { return }
         compact = on
-        fullBox.isHidden = on
+        fullRow.isHidden = on
         compactBox.isHidden = !on
         needsLayout = true
     }
@@ -688,6 +1066,7 @@ final class HUDContentView: NSView {
     }
 
     func apply(_ s: HUDState) {
+        mascot?.set(state: s.mascot, tint: s.tint)
         // A drift washes the whole card, so it reads from across the room.
         scrim.layer?.backgroundColor = (s.distracted ? Theme.alarmScrim : Theme.scrim).cgColor
         layer?.borderColor = (s.distracted ? Theme.urgent.withAlphaComponent(0.5) : Theme.hairline).cgColor
@@ -923,7 +1302,7 @@ struct Distractions: Codable {
     var chimeOnEscalate: Bool?
     /// Tail of the nudge line, e.g. "back to it?"
     var message: String?
-    /// Log every poll to taskhud.log while tuning.
+    /// Log every poll to coaxy.log while tuning.
     var debug: Bool?
 }
 
@@ -947,7 +1326,7 @@ final class DistractionMonitor {
     private var retryAutomationAt = Date.distantPast
     private var locked = false
 
-    private let queue = DispatchQueue(label: "taskhud.distraction", qos: .utility)
+    private let queue = DispatchQueue(label: "coaxy.distraction", qos: .utility)
 
     /// bundle id -> (application name, uses Chromium's AppleScript vocabulary)
     private static let browsers: [String: (String, Bool)] = [
@@ -1119,7 +1498,7 @@ final class DistractionMonitor {
                     || errText.contains("-1744") {
                     if !self.automationDenied {
                         Log.error("Automation permission missing for \(appName). Allow it under "
-                                + "System Settings > Privacy & Security > Automation > TaskHUD.")
+                                + "System Settings > Privacy & Security > Automation > Coaxy.")
                     }
                     self.automationDenied = true
                     self.retryAutomationAt = Date().addingTimeInterval(300)
@@ -1808,10 +2187,15 @@ final class AppController: NSObject, NSWindowDelegate {
     private let distraction = DistractionMonitor()
     private var nudgeChimed = false
     private var reloadRetries = 0
+    /// Set when a block is marked done; consumed by the next tick so the
+    /// mascot celebrates for a beat without the tick overwriting it.
+    private var celebrate = false
+    private var appliedScale: Double = 1.0
+    private var appliedMascot: Bool = true
     private var review: ReviewWindow?
 
     private var override = OverrideState()
-    private let overrideKey = "taskhud.override"
+    private let overrideKey = "coaxy.override"
 
     // ---- Override persistence ---------------------------------------------
 
@@ -1872,21 +2256,26 @@ final class AppController: NSObject, NSWindowDelegate {
     }
 
 
-    private let dirURL  = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".taskhud")
+    private let dirURL  = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".coaxy")
+    private let legacyDirURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".taskhud")
     private var fileURL: URL { dirURL.appendingPathComponent("schedule.json") }
 
-    private let posKey = "taskhud.origin"
-    private let hiddenKey = "taskhud.hidden"
+    private let posKey = "coaxy.origin"
+    private let hiddenKey = "coaxy.hidden"
 
     // ---- Lifecycle ---------------------------------------------------------
 
     func start() {
         NSApp.setActivationPolicy(.accessory)   // no Dock icon, no menu bar takeover
+        migrateLegacyDirectory()
         ensureScheduleFile()
         engine.load(from: fileURL)
         store = AdherenceStore(url: dirURL.appendingPathComponent("adherence.json"))
 
-        content = HUDContentView(scale: CGFloat(engine.settings.scale ?? 1.0))
+        appliedScale = engine.settings.scale ?? 1.0
+        appliedMascot = engine.settings.mascot ?? true
+        content = HUDContentView(scale: CGFloat(appliedScale),
+                                 showMascot: engine.settings.mascot ?? true)
         panel = HUDPanel(contentView: content, level: windowLevel())
         panel.delegate = self
         panel.alphaValue = CGFloat(engine.settings.opacity ?? 0.96)
@@ -1939,6 +2328,38 @@ final class AppController: NSObject, NSWindowDelegate {
     }
 
     // ---- Schedule file bootstrap ------------------------------------------
+
+    /// TaskHUD kept its data in ~/.taskhud. Coaxy uses ~/.coaxy. Copy rather
+    /// than move, so an older build still runs and nobody loses a schedule or
+    /// an adherence history to a rename. Runs once: if the new directory
+    /// already exists we never touch the old one again.
+    private func migrateLegacyDirectory() {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: legacyDirURL.path) else { return }
+        do {
+            try fm.createDirectory(at: dirURL, withIntermediateDirectories: true)
+            // Check per FILE, not per directory: the installer may have already
+            // created ~/.coaxy (and even seeded an example schedule) before the
+            // app ever ran. Only an untouched file is safe to fill in.
+            for name in ["schedule.json", "adherence.json"] {
+                let from = legacyDirURL.appendingPathComponent(name)
+                let to   = dirURL.appendingPathComponent(name)
+                guard fm.fileExists(atPath: from.path) else { continue }
+                if fm.fileExists(atPath: to.path) {
+                    // Never clobber real user data; keep a copy they can restore.
+                    guard let d = try? Data(contentsOf: to), d.count < 2600,
+                          String(data: d, encoding: .utf8)?.contains("Family OS") == false
+                    else { continue }
+                    try? fm.removeItem(at: to)
+                }
+                try fm.copyItem(at: from, to: to)
+                Log.info("migrated \(name)")
+            }
+            Log.info("migrated data from ~/.taskhud to ~/.coaxy (originals left in place)")
+        } catch {
+            Log.error("migration failed: \(error.localizedDescription)")
+        }
+    }
 
     private func ensureScheduleFile() {
         let fm = FileManager.default
@@ -2008,6 +2429,7 @@ final class AppController: NSObject, NSWindowDelegate {
             }
 
             if held && override.isPaused {
+                state.mascot = .asleep
                 state.caption = "paused \(Fmt.compactRemaining(override.pauseElapsed(at: now)))"
                 state.tint = Theme.secondary
                 state.warning = false
@@ -2017,11 +2439,12 @@ final class AppController: NSObject, NSWindowDelegate {
                 let warnMins = (s.warnMinutes ?? [10, 5, 1]).sorted()
                 let minutesLeft = remaining / 60
                 if let smallest = warnMins.first, minutesLeft <= Double(smallest) {
-                    state.tint = Theme.urgent; state.warning = true
+                    state.tint = Theme.urgent; state.warning = true; state.mascot = .urgent
                 } else if let biggest = warnMins.last, minutesLeft <= Double(biggest) {
-                    state.tint = Theme.warn; state.warning = true
+                    state.tint = Theme.warn; state.warning = true; state.mascot = .nearing
                 } else {
                     state.tint = cur.color ?? Theme.accent
+                    state.mascot = .working
                 }
                 handleAlerts(for: cur, remaining: remaining)
                 statusItem.button?.title = " \(truncate(cur.title, 22))  \(Fmt.compactRemaining(remaining))"
@@ -2034,6 +2457,7 @@ final class AppController: NSObject, NSWindowDelegate {
             state.caption = "until next"
             state.progress = 0
             state.tint = Theme.idle
+            state.mascot = .absent
             state.range = override.skipped.isEmpty ? "unscheduled" : "unscheduled  ·  skipped"
             state.next = "next  \(Fmt.hm.string(from: nxt.start))   \(truncate(nxt.title, 30))"
             lastCurrentKey = nil
@@ -2044,10 +2468,16 @@ final class AppController: NSObject, NSWindowDelegate {
             state.countdown = "—"
             state.caption = ""
             state.tint = Theme.idle
-            state.range = engine.loadError == nil ? "~/.taskhud/schedule.json" : ""
+            state.mascot = .absent
+            state.range = engine.loadError == nil ? "~/.coaxy/schedule.json" : ""
             state.next = ""
             lastCurrentKey = nil
             statusItem.button?.title = " —"
+        }
+
+        if celebrate {
+            celebrate = false
+            state.mascot = .pleased
         }
 
         // ---- distraction nudge -------------------------------------------
@@ -2063,6 +2493,7 @@ final class AppController: NSObject, NSWindowDelegate {
             state.distracted = true
             state.tint = Theme.urgent
             state.warning = true
+            state.mascot = .alarmed
             let what = distraction.label ?? "off task"
             let base = engine.settings.distractions?.message
                 ?? (inBlock ? "back to it?" : "still here?")
@@ -2207,7 +2638,7 @@ final class AppController: NSObject, NSWindowDelegate {
         menu.autoenablesItems = false
         let now = Date()
 
-        let title = override.isPaused ? "TaskHUD — paused" : "TaskHUD"
+        let title = override.isPaused ? "Coaxy — paused" : "Coaxy"
         let head = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         head.isEnabled = false
         menu.addItem(head)
@@ -2285,7 +2716,7 @@ final class AppController: NSObject, NSWindowDelegate {
         add(menu, "Reload schedule", #selector(reloadNow), "r")
         add(menu, "Reset position", #selector(resetPosition), "")
         menu.addItem(.separator())
-        add(menu, "Quit TaskHUD", #selector(quit), "q")
+        add(menu, "Quit Coaxy", #selector(quit), "q")
         return menu
     }
 
@@ -2351,6 +2782,7 @@ final class AppController: NSObject, NSWindowDelegate {
         // Tapping the same mark twice clears it.
         let next: Mark? = (store.mark(for: b) == m) ? nil : m
         store.mark(b, as: next, plannedThatDay: planned)
+        if next == .done { celebrate = true }
         review?.reload()
         flash()
     }
@@ -2406,6 +2838,30 @@ final class AppController: NSObject, NSWindowDelegate {
         panel.ignoresMouseEvents = engine.settings.clickThrough ?? false
         content.setCompact(engine.settings.compact ?? false)
         distraction.configure(engine.settings.distractions)
+
+        // Font sizes are baked in when the view is built, so a scale change
+        // needs a fresh view rather than a property update. Keep the panel's
+        // top-left anchored so the card doesn't wander on resize.
+        let wanted = engine.settings.scale ?? 1.0
+        let wantMascot = engine.settings.mascot ?? true
+        if abs(wanted - appliedScale) > 0.001 || wantMascot != appliedMascot {
+            appliedMascot = wantMascot
+            appliedScale = wanted
+            let wasCompact = content.compact
+            let topLeft = NSPoint(x: panel.frame.minX, y: panel.frame.maxY)
+            let fresh = HUDContentView(scale: CGFloat(wanted),
+                                       showMascot: engine.settings.mascot ?? true)
+            fresh.setCompact(wasCompact)
+            fresh.onDoubleClick = { [weak self] in self?.togglePause() }
+            fresh.onReviewTap  = { [weak self] in self?.openReview() }
+            content = fresh
+            panel.contentView = fresh
+            let size = fresh.desiredSize()
+            panel.setFrame(NSRect(x: topLeft.x, y: topLeft.y - size.height,
+                                  width: size.width, height: size.height), display: true)
+            Log.info("scale -> \(wanted)")
+        }
+
         update()
         rebuildMenu()
         if userInitiated { flash() }

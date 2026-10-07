@@ -18,3 +18,6 @@ taskhud.log
 *.corrupt-*.json
 
 .DS_Store
+
+# packaged builds
+*.dmg
