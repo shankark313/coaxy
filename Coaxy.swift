@@ -87,12 +87,14 @@ struct Settings: Codable {
     var distractions: Distractions?
     /// Show the animated character. Off falls back to the plain card.
     var mascot: Bool?
+    /// Float the character and text directly on the desktop with no card.
+    var chromeless: Bool?
 
     static let `default` = Settings(
         warnMinutes: [10, 5, 1], sound: true, startSound: "Glass", warnSound: "Tink",
         opacity: 0.96, compact: false, showSeconds: true,
         windowLevel: "screenSaver", clickThrough: false, scale: 1.0,
-        distractions: nil, mascot: true
+        distractions: nil, mascot: true, chromeless: true
     )
 
     func merged(over base: Settings) -> Settings {
@@ -108,7 +110,8 @@ struct Settings: Codable {
             clickThrough: clickThrough ?? base.clickThrough,
             scale:       scale       ?? base.scale,
             distractions: distractions ?? base.distractions,
-            mascot: mascot ?? base.mascot
+            mascot: mascot ?? base.mascot,
+            chromeless: chromeless ?? base.chromeless
         )
     }
 }
@@ -431,6 +434,24 @@ enum Theme {
     static let urgent = NSColor(srgbRed: 0.729, green: 0.239, blue: 0.176, alpha: 1)
     /// Soft red paper, washed over the card while drifting.
     static let alarmScrim = NSColor(srgbRed: 0.996, green: 0.925, blue: 0.906, alpha: 0.94)
+    // Chromeless mode has no card, so text sits directly on an unknown
+    // desktop. Near-white with a hard shadow is the only combination that
+    // survives both a white document and a dark photo underneath.
+    static let floatText      = NSColor(white: 1.00, alpha: 0.98)
+    static let floatSecondary = NSColor(white: 1.00, alpha: 0.74)
+    static let floatTertiary  = NSColor(white: 1.00, alpha: 0.52)
+    static let floatRule      = NSColor(white: 1.00, alpha: 0.26)
+
+    /// Drop shadow applied to every floating label. Tight and dark rather than
+    /// soft and wide — a wide blur reads as a glow and muddies small type.
+    static func floatShadow() -> NSShadow {
+        let s = NSShadow()
+        s.shadowColor = NSColor(white: 0, alpha: 0.78)
+        s.shadowOffset = NSSize(width: 0, height: -1)
+        s.shadowBlurRadius = 3.5
+        return s
+    }
+
     /// Nothing scheduled / free time.
     static let idle   = NSColor(srgbRed: 0.11, green: 0.11, blue: 0.12, alpha: 0.30)
 
@@ -458,13 +479,15 @@ final class ProgressBar: NSView {
     var tint: NSColor = Theme.accent {
         didSet { if tint != oldValue { needsDisplay = true } }
     }
+    /// Set when drawn over the desktop rather than inside a card.
+    var trackIsLight = false
 
     override var isFlipped: Bool { true }
     override var allowsVibrancy: Bool { false }
 
     override func draw(_ dirtyRect: NSRect) {
         guard bounds.width > 0 else { return }
-        Theme.rule.setFill()
+        (trackIsLight ? Theme.floatRule : Theme.rule).setFill()
         bounds.fill()
         let w = bounds.width * CGFloat(min(1, max(0, progress)))
         guard w > 0.5 else { return }
@@ -863,6 +886,7 @@ final class HUDContentView: NSView {
 
     private let scale: CGFloat
     private let showMascot: Bool
+    private let chromeless: Bool
     private(set) var compact: Bool = false
 
     override var isFlipped: Bool { true }
@@ -877,15 +901,22 @@ final class HUDContentView: NSView {
         super.mouseDown(with: event)
     }
 
-    init(scale: CGFloat, showMascot: Bool = true) {
+    init(scale: CGFloat, showMascot: Bool = true, chromeless: Bool = true) {
         self.scale = max(0.75, min(1.75, scale))
         self.showMascot = showMascot
+        self.chromeless = chromeless
         super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 150))
         wantsLayer = true
-        layer?.cornerRadius = 13 * self.scale
-        layer?.masksToBounds = true
-        layer?.borderWidth = 1
-        layer?.borderColor = Theme.hairline.cgColor
+        if chromeless {
+            // Nothing to clip to and nothing to outline: the window is the
+            // desktop. masksToBounds must stay off or the text shadows clip.
+            layer?.masksToBounds = false
+        } else {
+            layer?.cornerRadius = 13 * self.scale
+            layer?.masksToBounds = true
+            layer?.borderWidth = 1
+            layer?.borderColor = Theme.hairline.cgColor
+        }
         build()
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -898,26 +929,28 @@ final class HUDContentView: NSView {
     }
 
     private func build() {
-        effect.material = .popover
-        effect.appearance = NSAppearance(named: .aqua)
-        effect.blendingMode = .behindWindow
-        effect.state = .active
-        effect.wantsLayer = true
-        effect.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(effect)
+        if !chromeless {
+            effect.material = .popover
+            effect.appearance = NSAppearance(named: .aqua)
+            effect.blendingMode = .behindWindow
+            effect.state = .active
+            effect.wantsLayer = true
+            effect.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(effect)
 
-        scrim.wantsLayer = true
-        scrim.layer?.backgroundColor = Theme.scrim.cgColor
-        scrim.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(scrim)
+            scrim.wantsLayer = true
+            scrim.layer?.backgroundColor = Theme.scrim.cgColor
+            scrim.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(scrim)
 
-        for v in [effect, scrim] {
-            NSLayoutConstraint.activate([
-                v.leadingAnchor.constraint(equalTo: leadingAnchor),
-                v.trailingAnchor.constraint(equalTo: trailingAnchor),
-                v.topAnchor.constraint(equalTo: topAnchor),
-                v.bottomAnchor.constraint(equalTo: bottomAnchor)
-            ])
+            for v in [effect, scrim] {
+                NSLayoutConstraint.activate([
+                    v.leadingAnchor.constraint(equalTo: leadingAnchor),
+                    v.trailingAnchor.constraint(equalTo: trailingAnchor),
+                    v.topAnchor.constraint(equalTo: topAnchor),
+                    v.bottomAnchor.constraint(equalTo: bottomAnchor)
+                ])
+            }
         }
 
         for l in [rangeLabel, clockLabel, titleLabel, countdownLabel,
@@ -971,11 +1004,12 @@ final class HUDContentView: NSView {
         // countdown rather than the whole block, so it reads as attached to the
         // number that matters.
         if showMascot {
-            let m = VectorMascot(scale: scale)
+            let m = VectorMascot(scale: scale * (chromeless ? 1.55 : 1.0))
             m.translatesAutoresizingMaskIntoConstraints = false
             let sz = type(of: m).baseSize
-            m.widthAnchor.constraint(equalToConstant: sz.width * scale).isActive = true
-            m.heightAnchor.constraint(equalToConstant: sz.height * scale).isActive = true
+            let ms = scale * (chromeless ? 1.55 : 1.0)
+            m.widthAnchor.constraint(equalToConstant: sz.width * ms).isActive = true
+            m.heightAnchor.constraint(equalToConstant: sz.height * ms).isActive = true
             mascot = m
             let holder = NSView()
             holder.translatesAutoresizingMaskIntoConstraints = false
@@ -1022,8 +1056,8 @@ final class HUDContentView: NSView {
         outer.translatesAutoresizingMaskIntoConstraints = false
         addSubview(outer)
 
-        let padX = 17 * scale
-        let padY = 15 * scale
+        let padX = (chromeless ? 4 : 17) * scale
+        let padY = (chromeless ? 4 : 15) * scale
         NSLayoutConstraint.activate([
             outer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: padX),
             outer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -padX),
@@ -1059,47 +1093,59 @@ final class HUDContentView: NSView {
             ? NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight)
             : NSFont.systemFont(ofSize: size, weight: weight)
         l.font = f
-        l.attributedStringValue = NSAttributedString(string: s, attributes: [
+        var attrs: [NSAttributedString.Key: Any] = [
             .font: f, .foregroundColor: color, .kern: kern
-        ])
+        ]
+        if chromeless { attrs[.shadow] = Theme.floatShadow() }
+        l.attributedStringValue = NSAttributedString(string: s, attributes: attrs)
         l.invalidateIntrinsicContentSize()
     }
+
+    // Palette switches with the mode: ink-on-paper inside a card, near-white
+    // with a shadow when floating free on the desktop.
+    private var cText:      NSColor { chromeless ? Theme.floatText      : Theme.text }
+    private var cSecondary: NSColor { chromeless ? Theme.floatSecondary : Theme.secondary }
+    private var cTertiary:  NSColor { chromeless ? Theme.floatTertiary  : Theme.tertiary }
 
     func apply(_ s: HUDState) {
         mascot?.set(state: s.mascot, tint: s.tint)
         // A drift washes the whole card, so it reads from across the room.
-        scrim.layer?.backgroundColor = (s.distracted ? Theme.alarmScrim : Theme.scrim).cgColor
-        layer?.borderColor = (s.distracted ? Theme.urgent.withAlphaComponent(0.5) : Theme.hairline).cgColor
+        if !chromeless {
+            scrim.layer?.backgroundColor = (s.distracted ? Theme.alarmScrim : Theme.scrim).cgColor
+            layer?.borderColor = (s.distracted ? Theme.urgent.withAlphaComponent(0.5) : Theme.hairline).cgColor
+        }
         if compact {
             setLabel(compactTitle, s.title, size: 12.5 * scale, weight: .medium,
-                     color: Theme.text, kern: -0.1)
+                     color: cText, kern: -0.1)
             setLabel(compactCountdown, s.countdown, size: 12.5 * scale, weight: .regular,
-                     color: s.warning ? s.tint : Theme.secondary, kern: 0.2, monospaced: true)
+                     color: s.warning ? s.tint : cSecondary, kern: 0.2, monospaced: true)
             compactBar.progress = s.progress
             compactBar.tint = s.tint
+            compactBar.trackIsLight = chromeless
         } else {
             setLabel(rangeLabel, s.range.uppercased(), size: 9.5 * scale, weight: .medium,
-                     color: Theme.secondary, kern: 1.1)
+                     color: cSecondary, kern: 1.1)
             setLabel(clockLabel, s.clock, size: 9.5 * scale, weight: .medium,
-                     color: Theme.tertiary, kern: 0.9, monospaced: true)
+                     color: cTertiary, kern: 0.9, monospaced: true)
             setLabel(titleLabel, s.title, size: 15 * scale, weight: .medium,
-                     color: Theme.text, kern: -0.2)
+                     color: cText, kern: -0.2)
             setLabel(countdownLabel, s.countdown, size: 34 * scale, weight: .ultraLight,
-                     color: s.warning ? s.tint : Theme.text, kern: 0.5, monospaced: true)
+                     color: s.warning ? s.tint : cText, kern: 0.5, monospaced: true)
             setLabel(captionLabel, s.caption.uppercased(), size: 8.5 * scale, weight: .semibold,
-                     color: Theme.tertiary, kern: 1.2)
+                     color: cTertiary, kern: 1.2)
             if let n = s.nudge {
                 setLabel(nextLabel, n.uppercased(), size: 9 * scale, weight: .semibold,
                          color: Theme.urgent, kern: 1.0)
                 nextLabel.isHidden = false
             } else {
                 setLabel(nextLabel, s.next.uppercased(), size: 9 * scale, weight: .medium,
-                         color: Theme.tertiary, kern: 1.0)
+                         color: cTertiary, kern: 1.0)
                 nextLabel.isHidden = s.next.isEmpty
             }
 
             bar.progress = s.progress
             bar.tint = s.tint
+            bar.trackIsLight = chromeless
         }
 
         if let e = s.errorText {
@@ -1112,7 +1158,7 @@ final class HUDContentView: NSView {
     }
 
     func desiredSize() -> NSSize {
-        let width: CGFloat = (compact ? 236 : 296) * scale
+        let width: CGFloat = (compact ? 236 : (chromeless ? 330 : 296)) * scale
         layoutSubtreeIfNeeded()
         let fitting = outer.fittingSize.height + 30 * scale
         let floorH: CGFloat = (compact ? 52 : 148) * scale
@@ -1136,7 +1182,7 @@ final class HUDPanel: NSPanel {
         hidesOnDeactivate = false
         isOpaque = false
         backgroundColor = .clear
-        hasShadow = true
+        hasShadow = false
         isMovableByWindowBackground = true
         isReleasedWhenClosed = false
         ignoresMouseEvents = false
@@ -2192,6 +2238,7 @@ final class AppController: NSObject, NSWindowDelegate {
     private var celebrate = false
     private var appliedScale: Double = 1.0
     private var appliedMascot: Bool = true
+    private var appliedChromeless: Bool = true
     private var review: ReviewWindow?
 
     private var override = OverrideState()
@@ -2274,11 +2321,14 @@ final class AppController: NSObject, NSWindowDelegate {
 
         appliedScale = engine.settings.scale ?? 1.0
         appliedMascot = engine.settings.mascot ?? true
+        appliedChromeless = engine.settings.chromeless ?? true
         content = HUDContentView(scale: CGFloat(appliedScale),
-                                 showMascot: engine.settings.mascot ?? true)
+                                 showMascot: engine.settings.mascot ?? true,
+                                 chromeless: appliedChromeless)
         panel = HUDPanel(contentView: content, level: windowLevel())
         panel.delegate = self
-        panel.alphaValue = CGFloat(engine.settings.opacity ?? 0.96)
+        panel.alphaValue = CGFloat(engine.settings.opacity ?? 1.0)
+        panel.hasShadow = !(engine.settings.chromeless ?? true)
         panel.ignoresMouseEvents = engine.settings.clickThrough ?? false
         content.setCompact(engine.settings.compact ?? false)
         distraction.configure(engine.settings.distractions)
@@ -2833,7 +2883,8 @@ final class AppController: NSObject, NSWindowDelegate {
         saveOverride()
         firedAlerts.removeAll()
         lastCurrentKey = nil
-        panel.alphaValue = CGFloat(engine.settings.opacity ?? 0.96)
+        panel.alphaValue = CGFloat(engine.settings.opacity ?? 1.0)
+        panel.hasShadow = !(engine.settings.chromeless ?? true)
         panel.level = windowLevel()
         panel.ignoresMouseEvents = engine.settings.clickThrough ?? false
         content.setCompact(engine.settings.compact ?? false)
@@ -2844,13 +2895,17 @@ final class AppController: NSObject, NSWindowDelegate {
         // top-left anchored so the card doesn't wander on resize.
         let wanted = engine.settings.scale ?? 1.0
         let wantMascot = engine.settings.mascot ?? true
-        if abs(wanted - appliedScale) > 0.001 || wantMascot != appliedMascot {
+        let wantChromeless = engine.settings.chromeless ?? true
+        if abs(wanted - appliedScale) > 0.001 || wantMascot != appliedMascot
+            || wantChromeless != appliedChromeless {
             appliedMascot = wantMascot
+            appliedChromeless = wantChromeless
             appliedScale = wanted
             let wasCompact = content.compact
             let topLeft = NSPoint(x: panel.frame.minX, y: panel.frame.maxY)
             let fresh = HUDContentView(scale: CGFloat(wanted),
-                                       showMascot: engine.settings.mascot ?? true)
+                                       showMascot: engine.settings.mascot ?? true,
+                                       chromeless: appliedChromeless)
             fresh.setCompact(wasCompact)
             fresh.onDoubleClick = { [weak self] in self?.togglePause() }
             fresh.onReviewTap  = { [weak self] in self?.openReview() }
